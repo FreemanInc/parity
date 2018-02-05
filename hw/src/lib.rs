@@ -69,7 +69,7 @@ pub struct TransactionInfo {
 }
 
 /// Hardware wallet information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WalletInfo {
 	/// Wallet device name.
 	pub name: String,
@@ -140,31 +140,36 @@ struct EventHandler {
 }
 
 impl libusb::Hotplug for EventHandler {
-	fn device_arrived(&mut self, _device: libusb::Device) {
+	fn device_arrived(&mut self, device: libusb::Device) {
 		debug!("USB Device arrived");
+		let device_desc = device.device_descriptor().unwrap();
+		println!("idVendor: {:x}\t idProduct: {:x}", device_desc.vendor_id(), device_desc.product_id());
 		if let (Some(l), Some(t)) = (self.ledger.upgrade(), self.trezor.upgrade()) {
-			for _ in 0..10 {
-				let l_devices = l.update_devices().unwrap_or_else(|e| {
-					debug!("Error enumerating Ledger devices: {}", e);
-					0
-				});
-				let t_devices = t.update_devices().unwrap_or_else(|e| {
+
+				// let l_devices = l.update_devices().unwrap_or_else(|e| {
+				//     debug!("Error enumerating Ledger devices: {}", e);
+				//     0
+				// });
+				// let t_devices = t.update_devices().unwrap_or_else(|e| {
+				//     debug!("Error enumerating Trezor devices: {}", e);
+				//     0
+				// });
+				t.add_device(&device).unwrap_or_else(|e| {
 					debug!("Error enumerating Trezor devices: {}", e);
 					0
 				});
-				if l_devices + t_devices > 0 {
-					break;
-				}
-				thread::sleep(Duration::from_millis(200));
-			}
 		}
 	}
 
-	fn device_left(&mut self, _device: libusb::Device) {
+	fn device_left(&mut self, device: libusb::Device) {
 		debug!("USB Device lost");
+		// FIXME: replace update_devices() with ```remove _device```
 		if let (Some(l), Some(t)) = (self.ledger.upgrade(), self.trezor.upgrade()) {
-			l.update_devices().unwrap_or_else(|e| {debug!("Error enumerating Ledger devices: {}", e); 0});
-			t.update_devices().unwrap_or_else(|e| {debug!("Error enumerating Trezor devices: {}", e); 0});
+
+			t.remove_device(&device);
+
+			// l.update_devices().unwrap_or_else(|e| {debug!("Error enumerating Ledger devices: {}", e); 0});
+			// t.update_devices().unwrap_or_else(|e| {debug!("Error enumerating Trezor devices: {}", e); 0});
 		}
 	}
 }
@@ -176,12 +181,12 @@ impl HardwareWalletManager {
 		let ledger = Arc::new(ledger::Manager::new(hidapi.clone()));
 		let trezor = Arc::new(trezor::Manager::new(hidapi.clone()));
 		usb_context.register_callback(
-			None, None, None,
+			None, None, Some(0),
 			Box::new(EventHandler {
 				ledger: Arc::downgrade(&ledger),
 				trezor: Arc::downgrade(&trezor),
 			}),
-		)?;
+			)?;
 		let exiting = Arc::new(AtomicBool::new(false));
 		let thread_exiting = exiting.clone();
 		let l = ledger.clone();
@@ -189,21 +194,23 @@ impl HardwareWalletManager {
 		let thread = thread::Builder::new()
 			.name("hw_wallet".to_string())
 			.spawn(move || {
+				// check connected devices on startup!
 				if let Err(e) = l.update_devices() {
 					debug!("Error updating ledger devices: {}", e);
 				}
-				if let Err(e) = t.update_devices() {
-					debug!("Error updating trezor devices: {}", e);
-				}
+				// if let Err(e) = t.update_devices() {
+				//     debug!("Error updating trezor devices: {}", e);
+				// }
 				loop {
+					// Timeout for 500ms
 					usb_context.handle_events(Some(Duration::from_millis(500)))
-					           .unwrap_or_else(|e| debug!("Error processing USB events: {}", e));
+						.unwrap_or_else(|e| debug!("Error processing USB events: {}", e));
 					if thread_exiting.load(atomic::Ordering::Acquire) {
 						break;
 					}
 				}
 			})
-			.ok();
+		.ok();
 		Ok(HardwareWalletManager {
 			update_thread: thread,
 			exiting: exiting,

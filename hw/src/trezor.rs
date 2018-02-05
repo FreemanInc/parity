@@ -30,6 +30,7 @@ use ethereum_types::{U256, H256, Address};
 
 use ethkey::Signature;
 use hidapi;
+use libusb;
 use parking_lot::{Mutex, RwLock};
 use protobuf;
 use protobuf::{Message, ProtobufEnum};
@@ -41,6 +42,10 @@ const TREZOR_PIDS: [u16; 1] = [0x0001]; // Trezor v1, keeping this as an array t
 const ETH_DERIVATION_PATH: [u32; 5] = [0x8000002C, 0x8000003C, 0x80000000, 0, 0]; // m/44'/60'/0'/0/0
 const ETC_DERIVATION_PATH: [u32; 5] = [0x8000002C, 0x8000003D, 0x80000000, 0, 0]; // m/44'/61'/0'/0/0
 
+// Temporary move this to the Device struct later
+const INTERFACE: u8 = 0;
+const ENDPOINT_IN: u8 = 0x81;
+const ENDPOINT_OUT: u8 = 0x01;
 
 /// Hardware wallet error.
 #[derive(Debug)]
@@ -49,6 +54,8 @@ pub enum Error {
 	Protocol(&'static str),
 	/// Hidapi error.
 	Usb(hidapi::HidError),
+	/// libusb error.
+	PlaceHolder(libusb::Error),
 	/// Device with request key is not available.
 	KeyNotFound,
 	/// Signing has been cancelled by user.
@@ -64,6 +71,7 @@ impl fmt::Display for Error {
 		match *self {
 			Error::Protocol(ref s) => write!(f, "Trezor protocol error: {}", s),
 			Error::Usb(ref e) => write!(f, "USB communication error: {}", e),
+			Error::PlaceHolder(ref e) => write!(f, "USB communication error: {}", e),
 			Error::KeyNotFound => write!(f, "Key not found"),
 			Error::UserCancel => write!(f, "Operation has been cancelled"),
 			Error::BadMessageType => write!(f, "Bad Message Type in RPC call"),
@@ -75,6 +83,12 @@ impl fmt::Display for Error {
 impl From<hidapi::HidError> for Error {
 	fn from(err: hidapi::HidError) -> Error {
 		Error::Usb(err)
+	}
+}
+
+impl From<libusb::Error> for Error {
+	fn from(err: libusb::Error) -> Error {
+		Error::PlaceHolder(err)
 	}
 }
 
@@ -92,9 +106,28 @@ pub struct Manager {
 	key_path: RwLock<KeyPath>,
 }
 
-#[derive(Debug)]
+struct UsbInterface {
+	id: usize,
+	endpoints: Vec<Endpoint>,
+}
+
+#[derive(Debug, PartialEq)]
+struct Endpoint {
+	address: u8,
+	direction: libusb::Direction,
+	transfer_type: libusb::TransferType,
+}
+
+impl Endpoint {
+	pub fn new(address: u8, direction: libusb::Direction, transfer_type: libusb::TransferType) -> Self {
+		Endpoint { address: address, direction: direction, transfer_type: transfer_type }
+	}
+}
+
+
+#[derive(Debug, PartialEq)]
 struct Device {
-	path: String,
+	endpoints: Vec<Endpoint>,
 	info: WalletInfo,
 }
 
@@ -115,69 +148,141 @@ impl Manager {
 		}
 	}
 
-	/// Re-populate device list
-	pub fn update_devices(&self) -> Result<usize, Error> {
-		let mut usb = self.usb.lock();
-		usb.refresh_devices();
-		let devices = usb.devices();
-		let mut new_devices = Vec::new();
-		let mut closed_devices = Vec::new();
-		let mut error = None;
-		for usb_device in devices {
-			let is_trezor = usb_device.vendor_id == TREZOR_VID;
-			let is_supported_product = TREZOR_PIDS.contains(&usb_device.product_id);
-			let is_valid = usb_device.usage_page == 0xFF00 || usb_device.interface_number == 0;
+	pub fn add_device(&self, device: &libusb::Device) -> Result<usize, Error> {
+		let device_desc = device.device_descriptor()?;
+		let devices = &mut *self.devices.write();
 
-			trace!(
-				"Checking device: {:?}, trezor: {:?}, prod: {:?}, valid: {:?}",
-				usb_device,
-				is_trezor,
-				is_supported_product,
-				is_valid,
-			);
-			if !is_trezor || !is_supported_product || !is_valid {
-				continue;
-			}
-			match self.read_device_info(&usb, &usb_device) {
-				Ok(device) => new_devices.push(device),
-				Err(Error::ClosedDevice(path)) => closed_devices.push(path.to_string()),
+		let is_trezor = device_desc.vendor_id() == TREZOR_VID;
+		let is_supported_product = TREZOR_PIDS.contains(&device_desc.product_id());
+		//let is_valid = usb_device.usage_page == 0xFF00 || usb_device.interface_number == 0;
+
+		if is_trezor && is_supported_product {
+			match self.read_device_info_libusb(&device) {
+				Ok(dev) => {
+					if !devices.contains(&dev) {
+						println!("added device: {:?}", dev);
+						devices.push(dev);
+						Ok(1)
+					} else {
+						println!("devices: {:?}", devices);
+						Err(Error::UserCancel)
+					}
+
+				}
 				Err(e) => {
-					warn!("Error reading device: {:?}", e);
-					error = Some(e);
+					println!("read_device_error {:?}", e);
+					Err(e)
 				}
 			}
 		}
-		let count = new_devices.len();
-		trace!("Got devices: {:?}, closed: {:?}", new_devices, closed_devices);
-		*self.devices.write() = new_devices;
-		*self.closed_devices.write() = closed_devices;
-		match error {
-			Some(e) => Err(e),
-			None => Ok(count),
+		else {
+			println!("Error invalid trezOR");
+			Ok(1)
+		}
+		// lock dropped here
+	}
+
+	pub fn remove_device(&self, _device: &libusb::Device) -> Result<usize, Error> {
+		println!("remove device not implemented yet");
+		Ok(1)
+		// unimplemented!();
+	}
+
+
+	/// Re-populate device list
+	pub fn update_devices(&self) -> Result<usize, Error> {
+		unimplemented!();
+		// let mut usb = self.usb.lock();
+		// usb.refresh_devices();
+		// let devices = usb.devices();
+		// let mut new_devices = Vec::new();
+		// let mut closed_devices = Vec::new();
+		// let mut error = None;
+		// for usb_device in devices {
+		//     let is_trezor = usb_device.vendor_id == TREZOR_VID;
+		//     let is_supported_product = TREZOR_PIDS.contains(&usb_device.product_id);
+		//     let is_valid = usb_device.usage_page == 0xFF00 || usb_device.interface_number == 0;
+        //
+		//     trace!(
+		//         "Checking device: {:?}, trezor: {:?}, prod: {:?}, valid: {:?}",
+		//         usb_device,
+		//         is_trezor,
+		//         is_supported_product,
+		//         is_valid,
+		//     );
+		//     if !is_trezor || !is_supported_product || !is_valid {
+		//         continue;
+		//     }
+		//     match self.read_device_info(&usb, &usb_device) {
+		//         Ok(device) => new_devices.push(device),
+		//         Err(Error::ClosedDevice(path)) => closed_devices.push(path.to_string()),
+		//         Err(e) => {
+		//             warn!("Error reading device: {:?}", e);
+		//             error = Some(e);
+		//         }
+		//     }
+		// }
+		// let count = new_devices.len();
+		// trace!("Got devices: {:?}, closed: {:?}", new_devices, closed_devices);
+		// *self.devices.write() = new_devices;
+		// *self.closed_devices.write() = closed_devices;
+		// match error {
+		//     Some(e) => Err(e),
+		//     None => Ok(count),
+		// }
+}
+
+	fn read_device_info_libusb(&self, device: &libusb::Device) -> Result<Device, Error> {
+		println!("read_device_info_libusb");
+		// let handle = self.open_path(|| usb.open_path(&dev_info.path))?;
+		let desc = device.device_descriptor()?;
+		let config = device.active_config_descriptor()?;
+		let mut handle = device.open()?;
+		let timeout = Duration::from_millis(20);
+		let languages = handle.read_languages(timeout)?;
+
+		if languages.len() > 0 {
+
+            let manufacturer = handle.read_manufacturer_string(languages[0], &desc, timeout)?;
+            let name = handle.read_product_string(languages[0], &desc, timeout)?;
+			let serial = handle.read_serial_number_string(languages[0], &desc, timeout)?;
+			let endpoints = Manager::parse_endpoints(&config);
+
+
+			match self.get_address_libusb(&mut handle, &endpoints) {
+				Ok(Some(addr)) => {
+					Ok(Device {
+						endpoints: endpoints,
+						info: WalletInfo {
+							name: name,
+							manufacturer: manufacturer,
+							serial: serial,
+							address: addr,
+						},
+					})
+				}
+				_ => Err(Error::BadMessageType),
+			}
+		}
+
+		else {
+			Err(Error::BadMessageType)
 		}
 	}
 
-	fn read_device_info(&self, usb: &hidapi::HidApi, dev_info: &hidapi::HidDeviceInfo) -> Result<Device, Error> {
-		let handle = self.open_path(|| usb.open_path(&dev_info.path))?;
-		let manufacturer = dev_info.manufacturer_string.clone().unwrap_or("Unknown".to_owned());
-		let name = dev_info.product_string.clone().unwrap_or("Unknown".to_owned());
-		let serial = dev_info.serial_number.clone().unwrap_or("Unknown".to_owned());
-		match self.get_address(&handle) {
-			Ok(Some(addr)) => {
-				Ok(Device {
-					path: dev_info.path.clone(),
-					info: WalletInfo {
-						name: name,
-						manufacturer: manufacturer,
-						serial: serial,
-						address: addr,
-					},
-				})
-			}
-			Ok(None) => Err(Error::ClosedDevice(dev_info.path.clone())),
-			Err(e) => Err(e),
+	fn parse_endpoints(config: &libusb::ConfigDescriptor) -> Vec<Endpoint> {
+		let mut endpoints: Vec<Endpoint> = Vec::new();
+
+		for interface in config.interfaces() {
+			for interface_desc in interface.descriptors() {
+				for endpoint in interface_desc.endpoint_descriptors() {
+					endpoints.push( Endpoint::new(endpoint.address(), endpoint.direction(), endpoint.transfer_type()));
+                }
+            }
 		}
+		endpoints
 	}
+
 
 	/// Select key derivation path for a known chain.
 	pub fn set_key_path(&self, key_path: KeyPath) {
@@ -254,12 +359,32 @@ impl Manager {
 		}
 	}
 
+	fn get_address_libusb(&self, device: &mut libusb::DeviceHandle, endpoints: &Vec<Endpoint>) -> Result<Option<Address>, Error> {
+		let typ = MessageType::MessageType_EthereumGetAddress;
+		let mut message = EthereumGetAddress::new();
+		match *self.key_path.read() {
+			KeyPath::Ethereum => message.set_address_n(ETH_DERIVATION_PATH.to_vec()),
+			KeyPath::EthereumClassic => message.set_address_n(ETC_DERIVATION_PATH.to_vec()),
+		}
+		message.set_show_display(false);
+		println!("message: {:?}", message);
+		self.send_device_message_libusb(device, &typ, &message)?;
+
+		let (resp_type, bytes) = self.read_device_response_libusb(device)?;
+		match resp_type {
+			MessageType::MessageType_EthereumAddress => {
+				let response: EthereumAddress = protobuf::core::parse_from_bytes(&bytes)?;
+				Ok(Some(From::from(response.get_address())))
+			}
+			_ => Ok(None),
+		}
+	}
 	/// Sign transaction data with wallet managing `address`.
 	pub fn sign_transaction(&self, address: &Address, t_info: &TransactionInfo) -> Result<Signature, Error> {
 		let usb = self.usb.lock();
 		let devices = self.devices.read();
 		let device = devices.iter().find(|d| &d.info.address == address).ok_or(Error::KeyNotFound)?;
-		let handle = self.open_path(|| usb.open_path(&device.path))?;
+		// let handle = self.open_path(|| usb.open_path(&device.path))?;
 		let msg_type = MessageType::MessageType_EthereumSignTx;
 		let mut message = EthereumSignTx::new();
 		match *self.key_path.read() {
@@ -285,9 +410,10 @@ impl Manager {
 			message.set_chain_id(c_id as u32);
 		}
 
-		self.send_device_message(&handle, &msg_type, &message)?;
+		// self.send_device_message(&handle, &msg_type, &message)?;
 
-		self.signing_loop(&handle, &t_info.chain_id, &t_info.data[first_chunk_length..])
+		// self.signing_loop(&handle, &t_info.chain_id, &t_info.data[first_chunk_length..])
+		unimplemented!();
 	}
 
 	fn u256_to_be_vec(&self, val: &U256) -> Vec<u8> {
@@ -367,8 +493,77 @@ impl Manager {
 				HidVersion::V2 => vec![0, '?' as u8],
 			};
 			padded_chunk.extend_from_slice(&chunk);
+			println!("padded_chunk: {:?}", padded_chunk);
 			total_written += device.write(&padded_chunk)?;
 		}
+		Ok(total_written)
+	}
+
+	// Writes messages according to the TREZOR protocol V1
+	//
+	// First Packet:
+	//	+-----------------+-------------------------+------------------------+-------------------------+
+	//	| # # ? (3 Bytes) | Messsage Type (2 Bytes) | Message Size (4 Bytes) | Data+Padding (55 Bytes) |
+	//	+-----------------+-------------------------+------------------------+-------------------------+
+	//
+	// Other Packets:
+	//	+------------+-------------------------+
+	//	| ? (1 Byte) | Data+Padding (55 Bytes) |
+	//	+------------+-------------------------+
+	//
+	fn send_device_message_libusb(&self, device: &mut libusb::DeviceHandle, msg_type: &MessageType, msg: &Message) -> Result<usize, Error> {
+		println!("send_device_message_libusb");
+
+		let msg_id = *msg_type as u16;
+		let mut message = msg.write_to_bytes()?;
+		let msg_size = message.len();
+		let mut data = Vec::new();
+
+		// Magic constants
+		data.push('#' as u8);
+		data.push('#' as u8);
+		// Convert msg_id to BE and split into bytes
+		data.push(((msg_id >> 8) & 0xFF) as u8);
+		data.push((msg_id & 0xFF) as u8);
+		// Convert msg_size to BE and split into bytes
+		data.push(((msg_size >> 24) & 0xFF) as u8);
+		data.push(((msg_size >> 16) & 0xFF) as u8);
+		data.push(((msg_size >> 8) & 0xFF) as u8);
+		data.push((msg_size & 0xFF) as u8);
+		data.append(&mut message);
+
+		// Add padding inorder to be a multiple of 63
+		while data.len() % 63 != 0 {
+			data.push(0);
+		}
+
+		let mut total_written = 0;
+		println!("data: {:?}", data);
+
+		// libusb related!!
+		// If the current Interface is occupied we need to claim access to
+		if let Ok(_) = device.kernel_driver_active(INTERFACE) {
+			println!("kernel is active");
+
+			if let Ok(_) = device.detach_kernel_driver(INTERFACE) {
+				println!("detach kernel");
+
+			}
+		}
+
+		if let Ok(_) = device.claim_interface(INTERFACE) {
+			println!("interface claimed");
+		}
+
+
+		for chunk in data.chunks(63) {
+			let mut padded_chunk = vec!['?' as u8];
+			padded_chunk.extend_from_slice(&chunk);
+			println!("padded_chunk: {:?}", padded_chunk);
+			total_written += device.write_interrupt(ENDPOINT_OUT, &padded_chunk, Duration::from_millis(1000)).unwrap_or(0);
+			println!("write ok");
+		}
+		println!("{} bytes written to the device", total_written);
 		Ok(total_written)
 	}
 
@@ -401,6 +596,48 @@ impl Manager {
 		data.extend_from_slice(&buf[9..]);
 		while data.len() < (msg_size as usize) {
 			device.read_timeout(&mut buf, 10_000)?;
+			data.extend_from_slice(&buf[1..]);
+		}
+		Ok((msg_type, data[..msg_size as usize].to_vec()))
+	}
+
+	fn read_device_response_libusb(&self, device: &mut libusb::DeviceHandle) -> Result<(MessageType, Vec<u8>), Error> {
+		println!("read_device_response_libusb");
+		let protocol_err = Error::Protocol(&"Unexpected wire response from Trezor Device");
+		let mut buf = vec![0u8; 64];
+
+		// libusb related!!
+		// If the current Interface is occupied we need to claim access to
+		if let Ok(_) = device.kernel_driver_active(INTERFACE) {
+			println!("kernel is active");
+
+			if let Ok(_) = device.detach_kernel_driver(INTERFACE) {
+				println!("detach kernel");
+
+			}
+		}
+
+		if let Ok(_) = device.claim_interface(INTERFACE) {
+			println!("interface claimed");
+		}
+
+		let first_chunk = device.read_interrupt(ENDPOINT_IN, &mut buf, Duration::from_millis(1000)).unwrap_or(0);
+		println!("first_chunk: {:?}", first_chunk);
+
+		if first_chunk < 9 || buf[0] != '?' as u8 || buf[1] != '#' as u8 || buf[2] != '#' as u8 {
+			return Err(protocol_err);
+		}
+
+		let msg_type = MessageType::from_i32(((buf[3] as i32 & 0xFF) << 8) + (buf[4] as i32 & 0xFF)).ok_or(protocol_err)?;
+		let msg_size = ((buf[5] as u32 & 0xFF) << 24) + ((buf[6] as u32 & 0xFF) << 16) + ((buf[7] as u32 & 0xFF) << 8) + (buf[8] as u32 & 0xFF);
+		let mut data = Vec::new();
+		data.extend_from_slice(&buf[9..]);
+
+		println!("msg_type: {:?} \t msg_size: {:?}", msg_type, msg_size);
+		println!("data: {:?}", data);
+
+		while data.len() < (msg_size as usize) {
+			device.read_interrupt(ENDPOINT_IN, &mut buf, Duration::from_millis(1000))?;
 			data.extend_from_slice(&buf[1..]);
 		}
 		Ok((msg_type, data[..msg_size as usize].to_vec()))
