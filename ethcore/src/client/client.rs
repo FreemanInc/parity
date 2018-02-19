@@ -72,14 +72,14 @@ use verification;
 use verification::{PreverifiedBlock, Verifier};
 use verification::queue::BlockQueue;
 use views::BlockView;
+use contract_client::RegistryClient;
+
 
 // re-export
 pub use types::blockchain_info::BlockChainInfo;
 pub use types::block_status::BlockStatus;
 pub use blockchain::CacheSize as BlockChainCacheSize;
 pub use verification::queue::QueueInfo as BlockQueueInfo;
-
-use_contract!(registry, "Registry", "res/contracts/registrar.json");
 
 const MAX_TX_QUEUE_SIZE: usize = 4096;
 const MAX_QUEUE_SIZE_TO_SLEEP_ON: usize = 2;
@@ -164,7 +164,7 @@ pub struct Client {
 	history: u64,
 	ancient_verifier: Mutex<Option<AncientVerifier>>,
 	on_user_defaults_change: Mutex<Option<Box<FnMut(Option<Mode>) + 'static + Send>>>,
-	registrar: registry::Registry,
+	registrar: RegistryClient,
 	registrar_address: Option<Address>,
 	exit_handler: Mutex<Option<Box<Fn(bool, Option<String>) + 'static + Send>>>,
 }
@@ -256,7 +256,7 @@ impl Client {
 			history: history,
 			ancient_verifier: Mutex::new(None),
 			on_user_defaults_change: Mutex::new(None),
-			registrar: registry::Registry::default(),
+			registrar: RegistryClient::new(),
 			registrar_address,
 			exit_handler: Mutex::new(None),
 		});
@@ -1815,8 +1815,7 @@ impl BlockChainClient for Client {
 			None => return None,
 		};
 
-		self.registrar.functions()
-			.get_address()
+		self.registrar.get_address()
 			.call(keccak(name.as_bytes()), "A", &|data| self.call_contract(block, address, data))
 			.ok()
 			.and_then(|a| if a.is_zero() {
