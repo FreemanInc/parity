@@ -476,6 +476,7 @@ dependencies = [
  "ethkey 0.3.0",
  "ethstore 0.2.0",
  "evm 0.1.0",
+ "futures 0.1.18 (registry+https://github.com/rust-lang/crates.io-index)",
  "hardware-wallet 1.9.0",
  "hashdb 0.1.1",
  "heapsize 0.4.2 (registry+https://github.com/rust-lang/crates.io-index)",
